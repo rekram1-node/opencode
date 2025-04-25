@@ -2,12 +2,14 @@ package tui
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/opencode-ai/opencode/internal/app"
 	"github.com/opencode-ai/opencode/internal/config"
+	"github.com/opencode-ai/opencode/internal/llm/agent"
 	"github.com/opencode-ai/opencode/internal/logging"
 	"github.com/opencode-ai/opencode/internal/permission"
 	"github.com/opencode-ai/opencode/internal/pubsub"
@@ -25,6 +27,7 @@ type keyMap struct {
 	Help          key.Binding
 	SwitchSession key.Binding
 	Commands      key.Binding
+	Models        key.Binding
 }
 
 var keys = keyMap{
@@ -50,6 +53,11 @@ var keys = keyMap{
 	Commands: key.NewBinding(
 		key.WithKeys("ctrl+k"),
 		key.WithHelp("ctrl+k", "commands"),
+	),
+
+	Models: key.NewBinding(
+		key.WithKeys("ctrl+o"),
+		key.WithHelp("ctrl+o", "select model"),
 	),
 }
 
@@ -93,6 +101,9 @@ type appModel struct {
 	commandDialog     dialog.CommandDialog
 	commands          []dialog.Command
 
+	showModelDialog bool
+	modelDialog     dialog.ModelDialog
+
 	showInitDialog bool
 	initDialog     dialog.InitDialogCmp
 }
@@ -111,6 +122,8 @@ func (a appModel) Init() tea.Cmd {
 	cmd = a.sessionDialog.Init()
 	cmds = append(cmds, cmd)
 	cmd = a.commandDialog.Init()
+	cmds = append(cmds, cmd)
+	cmd = a.modelDialog.Init()
 	cmds = append(cmds, cmd)
 	cmd = a.initDialog.Init()
 	cmds = append(cmds, cmd)
@@ -158,6 +171,10 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		command, commandCmd := a.commandDialog.Update(msg)
 		a.commandDialog = command.(dialog.CommandDialog)
 		cmds = append(cmds, commandCmd)
+
+		model, modelCmd := a.modelDialog.Update(msg)
+		a.modelDialog = model.(dialog.ModelDialog)
+		cmds = append(cmds, modelCmd)
 
 		a.initDialog.SetSize(msg.Width, msg.Height)
 
@@ -239,6 +256,73 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.showSessionDialog = false
 		return a, nil
 
+	case dialog.ModelSelectedMsg:
+		a.showModelDialog = false
+		// Update the agent's model
+		if a.currentPage == page.ChatPage {
+			// Set the selected model for the coder agent
+			cfg := config.Get()
+			if cfg != nil {
+				logging.Info("Changing model", 
+					"from", cfg.Agents[config.AgentCoder].Model,
+					"to", msg.Model.ID)
+				
+				// Store the original model in case we need to revert
+				originalModel := cfg.Agents[config.AgentCoder].Model
+				
+				// Update the config with the new model
+				updatedAgent := cfg.Agents[config.AgentCoder]
+				updatedAgent.Model = msg.Model.ID
+				cfg.Agents[config.AgentCoder] = updatedAgent
+
+				// Check if the agent is busy before recreating it
+				if a.app.CoderAgent.IsBusy() {
+					logging.Warn("Cannot change model while agent is busy")
+					// Revert the model change
+					updatedAgent.Model = originalModel
+					cfg.Agents[config.AgentCoder] = updatedAgent
+					return a, util.ReportWarn("Cannot change model while agent is busy")
+				}
+
+				// Recreate the agent with the new model
+				logging.Info("Recreating agent with new model")
+				newAgent, err := agent.NewAgent(
+					config.AgentCoder,
+					a.app.Sessions,
+					a.app.Messages,
+					agent.CoderAgentTools(
+						a.app.Permissions,
+						a.app.Sessions,
+						a.app.Messages,
+						a.app.History,
+						a.app.LSPClients,
+					),
+				)
+				if err != nil {
+					logging.Error("Failed to create agent with new model", 
+						"error", err,
+						"model", msg.Model.ID)
+					
+					// Revert the model change
+					updatedAgent.Model = originalModel
+					cfg.Agents[config.AgentCoder] = updatedAgent
+					
+					return a, util.ReportError(fmt.Errorf("failed to change model: %w", err))
+				} else {
+					logging.Info("Successfully created new agent with model", 
+						"model", msg.Model.ID)
+					a.app.CoderAgent = newAgent
+				}
+			} else {
+				logging.Error("Config is nil, cannot change model")
+			}
+		}
+		return a, nil
+
+	case dialog.CloseModelDialogMsg:
+		a.showModelDialog = false
+		return a, nil
+
 	case dialog.CloseCommandDialogMsg:
 		a.showCommandDialog = false
 		return a, nil
@@ -298,9 +382,12 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.showCommandDialog {
 				a.showCommandDialog = false
 			}
+			if a.showModelDialog {
+				a.showModelDialog = false
+			}
 			return a, nil
 		case key.Matches(msg, keys.SwitchSession):
-			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showCommandDialog {
+			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showCommandDialog && !a.showModelDialog {
 				// Load sessions and show the dialog
 				sessions, err := a.app.Sessions.List(context.Background())
 				if err != nil {
@@ -315,13 +402,31 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return a, nil
 		case key.Matches(msg, keys.Commands):
-			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog {
+			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showModelDialog {
 				// Show commands dialog
 				if len(a.commands) == 0 {
 					return a, util.ReportWarn("No commands available")
 				}
 				a.commandDialog.SetCommands(a.commands)
 				a.showCommandDialog = true
+				return a, nil
+			}
+			return a, nil
+		case key.Matches(msg, keys.Models):
+			logging.Info("Model selection key pressed")
+			if a.currentPage == page.ChatPage && !a.showQuit && !a.showPermissions && !a.showSessionDialog && !a.showCommandDialog {
+				// Show model selection dialog
+				availableModels := dialog.GetAvailableModels()
+				if len(availableModels) == 0 {
+					return a, util.ReportWarn("No models available. Check your API keys.")
+				}
+				a.modelDialog.SetModels(availableModels)
+				// Set the currently selected model
+				cfg := config.Get()
+				if cfg != nil && cfg.Agents[config.AgentCoder].Model != "" {
+					a.modelDialog.SetSelectedModel(cfg.Agents[config.AgentCoder].Model)
+				}
+				a.showModelDialog = true
 				return a, nil
 			}
 			return a, nil
@@ -399,6 +504,16 @@ func (a appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		d, commandCmd := a.commandDialog.Update(msg)
 		a.commandDialog = d.(dialog.CommandDialog)
 		cmds = append(cmds, commandCmd)
+		// Only block key messages send all other messages down
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return a, tea.Batch(cmds...)
+		}
+	}
+
+	if a.showModelDialog {
+		d, modelCmd := a.modelDialog.Update(msg)
+		a.modelDialog = d.(dialog.ModelDialog)
+		cmds = append(cmds, modelCmd)
 		// Only block key messages send all other messages down
 		if _, ok := msg.(tea.KeyMsg); ok {
 			return a, tea.Batch(cmds...)
@@ -486,6 +601,10 @@ func (a appModel) View() string {
 		if a.showPermissions {
 			bindings = append(bindings, a.permissions.BindingKeys()...)
 		}
+
+		if a.showModelDialog {
+			bindings = append(bindings, a.modelDialog.BindingKeys()...)
+		}
 		if a.currentPage == page.LogsPage {
 			bindings = append(bindings, logsKeyReturnKey)
 		}
@@ -553,6 +672,22 @@ func (a appModel) View() string {
 		)
 	}
 
+	if a.showModelDialog {
+		logging.Info("Rendering model dialog")
+		overlay := a.modelDialog.View()
+		row := lipgloss.Height(appView) / 2
+		row -= lipgloss.Height(overlay) / 2
+		col := lipgloss.Width(appView) / 2
+		col -= lipgloss.Width(overlay) / 2
+		appView = layout.PlaceOverlay(
+			col,
+			row,
+			overlay,
+			appView,
+			true,
+		)
+	}
+
 	if a.showInitDialog {
 		overlay := a.initDialog.View()
 		appView = layout.PlaceOverlay(
@@ -569,6 +704,11 @@ func (a appModel) View() string {
 
 func New(app *app.App) tea.Model {
 	startPage := page.ChatPage
+
+	// Initialize the model dialog
+	modelDialog := dialog.NewModelDialogCmp()
+	logging.Info("Model dialog initialized")
+
 	model := &appModel{
 		currentPage:   startPage,
 		loadedPages:   make(map[page.PageID]bool),
@@ -577,6 +717,7 @@ func New(app *app.App) tea.Model {
 		quit:          dialog.NewQuitCmp(),
 		sessionDialog: dialog.NewSessionDialogCmp(),
 		commandDialog: dialog.NewCommandDialogCmp(),
+		modelDialog:   modelDialog,
 		permissions:   dialog.NewPermissionDialogCmp(),
 		initDialog:    dialog.NewInitDialogCmp(),
 		app:           app,
@@ -604,6 +745,32 @@ If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (
 					Text: prompt,
 				}),
 			)
+		},
+	})
+
+	model.RegisterCommand(dialog.Command{
+		ID:          "select-model",
+		Title:       "Select Model",
+		Description: "Choose a different LLM model",
+		Handler: func(cmd dialog.Command) tea.Cmd {
+			// Show model selection dialog
+			availableModels := dialog.GetAvailableModels()
+			if len(availableModels) == 0 {
+				return util.ReportWarn("No models available. Check your API keys.")
+			}
+
+			// Set the models in the dialog
+			model.modelDialog.SetModels(availableModels)
+
+			// Set the currently selected model
+			cfg := config.Get()
+			if cfg != nil && cfg.Agents[config.AgentCoder].Model != "" {
+				model.modelDialog.SetSelectedModel(cfg.Agents[config.AgentCoder].Model)
+			}
+
+			// Show the dialog
+			model.showModelDialog = true
+			return nil
 		},
 	})
 	return model

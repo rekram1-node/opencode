@@ -20,14 +20,12 @@ var providersCmd = &cobra.Command{
 }
 
 func displayAllModels() error {
-	// Group models by provider
 	providerModels := make(map[models.ModelProvider][]models.Model)
 
 	for _, model := range models.SupportedModels {
 		providerModels[model.Provider] = append(providerModels[model.Provider], model)
 	}
 
-	// Sort providers for consistent output
 	providers := make([]models.ModelProvider, 0, len(providerModels))
 	for provider := range providerModels {
 		providers = append(providers, provider)
@@ -36,17 +34,12 @@ func displayAllModels() error {
 		return string(providers[i]) < string(providers[j])
 	})
 
-	return outputTable(providers, providerModels)
-}
-
-func outputTable(providers []models.ModelProvider, providerModels map[models.ModelProvider][]models.Model) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "PROVIDER\tMODEL ID\tNAME")
 
 	for _, provider := range providers {
 		modelList := providerModels[provider]
 
-		// Sort models by name
 		sort.Slice(modelList, func(i, j int) bool {
 			return modelList[i].Name < modelList[j].Name
 		})
